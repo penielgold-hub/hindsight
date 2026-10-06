@@ -18,6 +18,7 @@ from hindsight_api.engine.consolidation.consolidator import (
     _build_response_model,
     _count_observations_for_scope,
     _find_related_observations,
+    _resolve_action_source_memories,
     run_consolidation_job,
 )
 from hindsight_api.engine.memory_engine import MemoryEngine
@@ -2416,6 +2417,63 @@ class TestBuildResponseModel:
         )
         assert len(result.updates) == 2
         assert len(result.deletes) == 1
+
+    def test_partial_source_resolution_keeps_valid_ids_and_reports_unmatched(self):
+        facts = {"fact-a": {"id": "fact-a"}, "fact-b": {"id": "fact-b"}}
+
+        resolved, unresolved = _resolve_action_source_memories(
+            ["fact-a", "hallucinated-fact", "fact-b"], facts
+        )
+
+        assert resolved == [facts["fact-a"], facts["fact-b"]]
+        assert unresolved == ["hallucinated-fact"]
+
+    @pytest.mark.parametrize("action_type", ["creates", "updates"])
+    def test_source_fact_ids_restricted_to_current_batch(self, action_type: str):
+        """Regression for #5273: both action types advertise only current batch IDs."""
+        from pydantic import ValidationError
+
+        model = _build_response_model(
+            2,
+            valid_source_fact_ids=["fact-a", "fact-b"],
+        )
+
+        schema = model.model_json_schema()
+        action_schema = schema["$defs"][
+            "_ConstrainedCreateAction" if action_type == "creates" else "_ConstrainedUpdateAction"
+        ]
+        assert action_schema["properties"]["source_fact_ids"]["items"]["enum"] == ["fact-a", "fact-b"]
+        assert action_schema["properties"]["source_fact_ids"]["minItems"] == 1
+
+        action = {"text": "observation", "source_fact_ids": ["hallucinated-fact-id"]}
+        if action_type == "updates":
+            action["observation_id"] = "observation-id"
+        with pytest.raises(ValidationError):
+            model(
+                **{
+                    "creates": [action] if action_type == "creates" else [],
+                    "updates": [action] if action_type == "updates" else [],
+                    "deletes": [],
+                }
+            )
+        action["source_fact_ids"] = []
+        with pytest.raises(ValidationError):
+            model(
+                **{
+                    "creates": [action] if action_type == "creates" else [],
+                    "updates": [action] if action_type == "updates" else [],
+                    "deletes": [],
+                }
+            )
+
+    def test_source_fact_ids_schema_opt_out_preserves_list_validation(self):
+        """Backends opting out of schema constraints still receive permissive validation."""
+        from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
+
+        model = _build_response_model(2, supports_max_items=False, valid_source_fact_ids=["fact-a"])
+        assert model is _ConsolidationBatchResponse
+        result = model(creates=[{"text": "obs", "source_fact_ids": ["hallucinated"]}], updates=[], deletes=[])
+        assert result.creates[0].source_fact_ids == ["hallucinated"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(("remaining_slots", "expected_creates"), [(0, 0), (2, 2)])

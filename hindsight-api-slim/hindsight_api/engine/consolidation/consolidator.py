@@ -700,6 +700,15 @@ def _unique_source_ids(v: str | list[str]) -> list[str]:
     return list(dict.fromkeys(v))
 
 
+def _resolve_action_source_memories(
+    source_fact_ids: list[str], mem_by_id: dict[str, dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Resolve known source facts while preserving visibility of unknown IDs."""
+    unresolved_ids = [fact_id for fact_id in source_fact_ids if fact_id not in mem_by_id]
+    source_memories = [mem_by_id[fact_id] for fact_id in source_fact_ids if fact_id in mem_by_id]
+    return source_memories, unresolved_ids
+
+
 class _CreateAction(BaseModel):
     text: str
     source_fact_ids: list[str]  # memory UUIDs from the NEW FACTS list
@@ -1153,25 +1162,50 @@ def _build_response_model(
     max_creates: int | None = None,
     *,
     supports_max_items: bool = True,
+    valid_source_fact_ids: list[str] | None = None,
 ) -> type[_ConsolidationBatchResponse]:
-    """Build a response model, optionally constraining creates via JSON schema.
+    """Build a response model, optionally constraining creates and source IDs via JSON schema.
 
     Some structured-output backends (notably Bedrock Converse) reject the JSON
     Schema ``maxItems`` keyword emitted by Pydantic's list ``max_length``. Operators
     can disable the schema hint for those backends; the prompt capacity note and
     post-response truncation still enforce the observation cap.
     """
-    if not supports_max_items or max_creates is None or max_creates < 0:
+    constrain_sources = supports_max_items and valid_source_fact_ids is not None
+    constrain_creates = supports_max_items and max_creates is not None and max_creates >= 0
+    if not constrain_sources and not constrain_creates:
         return _ConsolidationBatchResponse
 
-    from pydantic import Field as PydanticField
+    from pydantic import Field as PydanticField, create_model
 
-    clamped = max(max_creates, 0)
+    create_action: type[_CreateAction] = _CreateAction
+    update_action: type[_UpdateAction] = _UpdateAction
+    if constrain_sources:
+        from typing import Literal
 
-    class _ConstrainedConsolidationBatchResponse(_ConsolidationBatchResponse):
-        creates: list[_CreateAction] = PydanticField(default=[], max_length=clamped)
+        source_id_type = Literal.__getitem__(tuple(valid_source_fact_ids)) if valid_source_fact_ids else str
+        create_action = create_model(
+            "_ConstrainedCreateAction",
+            __base__=_CreateAction,
+            source_fact_ids=(list[source_id_type], PydanticField(min_length=1)),
+        )
+        update_action = create_model(
+            "_ConstrainedUpdateAction",
+            __base__=_UpdateAction,
+            source_fact_ids=(list[source_id_type], PydanticField(min_length=1)),
+        )
 
-    return _ConstrainedConsolidationBatchResponse
+    response_fields: dict[str, Any] = {
+        "creates": (list[create_action], PydanticField(default=[], max_length=max_creates))
+        if constrain_creates
+        else (list[create_action], PydanticField(default=[])),
+        "updates": (list[update_action], PydanticField(default=[])),
+    }
+    return create_model(
+        "_ConstrainedConsolidationBatchResponse",
+        __base__=_ConsolidationBatchResponse,
+        **response_fields,
+    )
 
 
 class ConsolidationPerfLog:
@@ -1187,6 +1221,7 @@ class ConsolidationPerfLog:
         self.total_obs_in_context: int = 0
         self.total_prompt_chars: int = 0
         self.llm_batch_failures: int = 0
+        self.unresolved_source_actions: int = 0
 
     def log(self, message: str) -> None:
         """Add a log line."""
@@ -1211,6 +1246,9 @@ class ConsolidationPerfLog:
         """Record LLM batch attempts that raised, whether or not a retry rescued them."""
         self.llm_batch_failures += count
 
+    def record_unresolved_source_action(self) -> None:
+        self.unresolved_source_actions += 1
+
     def merge_from(self, other: "ConsolidationPerfLog") -> None:
         """Merge a per-batch perf log into this (job-level) one.
 
@@ -1232,12 +1270,16 @@ class ConsolidationPerfLog:
         self.total_obs_in_context += other.total_obs_in_context
         self.total_prompt_chars += other.total_prompt_chars
         self.llm_batch_failures += other.llm_batch_failures
+        self.unresolved_source_actions += other.unresolved_source_actions
 
     def flush(self) -> None:
         """Flush all log lines to the logger."""
         total_time = time.time() - self.start_time
         header = f"\n{'=' * 60}\nCONSOLIDATION for bank {self.bank_id}"
-        footer = f"{'=' * 60}\nCONSOLIDATION COMPLETE: {total_time:.3f}s total\n{'=' * 60}"
+        footer = (
+            f"{'=' * 60}\nCONSOLIDATION COMPLETE: {total_time:.3f}s total; "
+            f"unresolved_source_actions={self.unresolved_source_actions}\n{'=' * 60}"
+        )
 
         log_output = header + "\n" + "\n".join(self.lines) + "\n" + footer
         logger.info(log_output)
@@ -2440,7 +2482,16 @@ async def _process_memory_batch(
     # --- Prepare: updates -----------------------------------------------------
     prepared_updates: list[_PreparedUpdate] = []
     for update in llm_result.updates:
-        source_mems = [mem_by_id[fid] for fid in update.source_fact_ids if fid in mem_by_id]
+        source_mems, unresolved_ids = _resolve_action_source_memories(update.source_fact_ids, mem_by_id)
+        if unresolved_ids:
+            if perf is not None:
+                perf.record_unresolved_source_action()
+            logger.warning(
+                "[CONSOLIDATION] update action references source_fact_ids outside its batch; "
+                "observation_id=%s unresolved_ids=%s",
+                update.observation_id,
+                unresolved_ids,
+            )
         if not source_mems:
             continue
         # Security: the observation must have been recalled for at least one of the source facts
@@ -2506,7 +2557,16 @@ async def _process_memory_batch(
 
     prepared_creates: list[_PreparedCreate] = []
     for create in llm_result.creates:
-        source_mems = [mem_by_id[fid] for fid in create.source_fact_ids if fid in mem_by_id]
+        source_mems, unresolved_ids = _resolve_action_source_memories(create.source_fact_ids, mem_by_id)
+        if unresolved_ids:
+            if perf is not None:
+                perf.record_unresolved_source_action()
+            logger.warning(
+                "[CONSOLIDATION] create action references source_fact_ids outside its batch; "
+                "unresolved_ids=%s reason=%r",
+                unresolved_ids,
+                create.reason or "(none given)",
+            )
         if not source_mems:
             continue
         agg = _aggregate_source_fields(source_mems, tags=fact_tags)
@@ -3250,10 +3310,12 @@ async def _consolidate_batch_with_llm(
     # of the cached prefix, so keying on it would needlessly bust the cache.
     prompt_cache = PromptCachePrefix(system_instruction=system_prompt)
 
-    # Use a constrained response model when observation limit is active
+    # Use a response model that constrains action source IDs to this exact batch.
+    memory_ids = [str(m.get("id")) for m in memories]
     response_model = _build_response_model(
         max_creates=remaining_observation_slots,
         supports_max_items=config.llm_supports_max_items,
+        valid_source_fact_ids=memory_ids,
     )
 
     max_attempts = config.consolidation_max_attempts
@@ -3265,7 +3327,6 @@ async def _consolidate_batch_with_llm(
     # exact memories whose consolidation is failing — without this, an opaque
     # "LLM batch call failed" line gives operators no way to find the offending
     # input until adaptive bisection narrows the batch down to a single memory.
-    memory_ids = [str(m.get("id")) for m in memories]
     if len(memory_ids) <= 5:
         ids_label = ", ".join(memory_ids)
     else:
