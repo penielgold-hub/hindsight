@@ -133,6 +133,30 @@ def provider_json_schema(response_format: type[BaseModel]) -> dict[str, Any]:
     return response_format.model_json_schema(schema_generator=UnionSafeSchemaGenerator)
 
 
+def bedrock_json_schema(response_format: type[BaseModel]) -> dict[str, Any]:
+    """Serialize a provider schema without integer bounds rejected by Bedrock.
+
+    Bedrock Converse rejects ``minimum`` and ``maximum`` on integer schemas.
+    Those constraints remain enforced by Pydantic when the model response is
+    parsed; this only omits them from the schema sent to Bedrock.
+    """
+    schema = provider_json_schema(response_format)
+
+    def strip_integer_bounds(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "integer":
+                node.pop("minimum", None)
+                node.pop("maximum", None)
+            for value in node.values():
+                strip_integer_bounds(value)
+        elif isinstance(node, list):
+            for item in node:
+                strip_integer_bounds(item)
+
+    strip_integer_bounds(schema)
+    return schema
+
+
 @lru_cache(maxsize=None)
 def has_tagged_union(response_format: type[BaseModel]) -> bool:
     """Whether serializing this model rewrites a tagged union.

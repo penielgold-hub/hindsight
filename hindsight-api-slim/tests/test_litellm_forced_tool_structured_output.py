@@ -12,7 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from hindsight_api.config import ENV_LLM_STRUCTURED_OUTPUT_FORCED_TOOL, HindsightConfig
 from hindsight_api.engine.llm_wrapper import LLMConfig
@@ -23,6 +23,14 @@ _MESSAGES = [{"role": "user", "content": "hi"}]
 
 class _Facts(BaseModel):
     facts: list[str]
+
+
+class _NestedLevel(BaseModel):
+    level: int = Field(default=2, ge=1, le=6)
+
+
+class _Refresh(BaseModel):
+    nested: _NestedLevel
 
 
 def _make_litellm(*, forced_tool: bool) -> LiteLLMLLM:
@@ -65,11 +73,13 @@ class _Response:
         self.usage = None
 
 
-async def _call_capturing_request(llm: LiteLLMLLM, response: _Response) -> dict[str, Any]:
+async def _call_capturing_request(
+    llm: LiteLLMLLM, response: _Response, response_format: type[BaseModel] = _Facts
+) -> dict[str, Any]:
     """Run ``call`` against a stubbed completion and return the request kwargs."""
     completion = AsyncMock(return_value=response)
     llm._acompletion = completion  # type: ignore[method-assign]
-    result = (await llm.call(messages=_MESSAGES, response_format=_Facts, max_retries=0)).content
+    result = (await llm.call(messages=_MESSAGES, response_format=response_format, max_retries=0)).content
     return {"kwargs": completion.await_args.kwargs, "result": result}
 
 
@@ -142,6 +152,37 @@ async def test_flag_off_keeps_response_format():
     assert "tool_choice" not in kwargs
     assert kwargs["response_format"]["json_schema"]["schema"] == _Facts.model_json_schema()
     assert captured["result"] == _Facts(facts=["the sky is blue"])
+
+
+@pytest.mark.asyncio
+async def test_bedrock_schema_drops_nested_integer_bounds_but_keeps_validation():
+    llm = _make_litellm(forced_tool=False)
+    response = _Response(_Message('{"nested": {"level": 3}}'), finish_reason="stop")
+
+    captured = await _call_capturing_request(llm, response, _Refresh)
+
+    schema = captured["kwargs"]["response_format"]["json_schema"]["schema"]
+    level_schema = schema["$defs"]["_NestedLevel"]["properties"]["level"]
+    assert "minimum" not in level_schema
+    assert "maximum" not in level_schema
+    assert captured["result"] == _Refresh(nested=_NestedLevel(level=3))
+    with pytest.raises(ValidationError):
+        _NestedLevel(level=7)
+
+
+@pytest.mark.asyncio
+async def test_non_bedrock_schema_keeps_integer_bounds():
+    llm = LiteLLMLLM(provider="litellm", api_key="", base_url="", model="openai/test")
+    response = _Response(_Message('{"nested": {"level": 3}}'), finish_reason="stop")
+    completion = AsyncMock(return_value=response)
+    llm._acompletion = completion  # type: ignore[method-assign]
+
+    await llm.call(messages=_MESSAGES, response_format=_Refresh, max_retries=0)
+
+    schema = completion.await_args.kwargs["response_format"]["json_schema"]["schema"]
+    level_schema = schema["$defs"]["_NestedLevel"]["properties"]["level"]
+    assert level_schema["minimum"] == 1
+    assert level_schema["maximum"] == 6
 
 
 @pytest.mark.asyncio

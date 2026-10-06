@@ -33,7 +33,7 @@ from hindsight_api.engine.llm_wrapper import parse_llm_json
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences, visible_token_usage
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
-from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
+from hindsight_api.engine.structured_output import bedrock_json_schema, provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
@@ -302,7 +302,10 @@ class LiteLLMLLM(LLMInterface):
         # Add JSON schema response format if provided
         use_forced_tool = False
         if response_format is not None and hasattr(response_format, "model_json_schema"):
-            schema = strict_json_schema(response_format) if strict_schema else provider_json_schema(response_format)
+            if self.provider.lower() == "bedrock":
+                schema = bedrock_json_schema(response_format)
+            else:
+                schema = strict_json_schema(response_format) if strict_schema else provider_json_schema(response_format)
             schema_name = response_format.__name__ if hasattr(response_format, "__name__") else "response"
             if self.structured_output_forced_tool:
                 # The schema travels as the tool's parameters and the model is forced
