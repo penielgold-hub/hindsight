@@ -2445,9 +2445,21 @@ class TestBuildResponseModel:
         assert action_schema["properties"]["source_fact_ids"]["items"]["enum"] == ["fact-a", "fact-b"]
         assert action_schema["properties"]["source_fact_ids"]["minItems"] == 1
 
+        # Runtime parsing remains list[str] even if a provider ignores the enum hint.
         action = {"text": "observation", "source_fact_ids": ["hallucinated-fact-id"]}
         if action_type == "updates":
             action["observation_id"] = "observation-id"
+        result = model(
+            **{
+                "creates": [action] if action_type == "creates" else [],
+                "updates": [action] if action_type == "updates" else [],
+                "deletes": [],
+            }
+        )
+        parsed_action = result.creates[0] if action_type == "creates" else result.updates[0]
+        assert parsed_action.source_fact_ids == ["hallucinated-fact-id"]
+
+        action["source_fact_ids"] = [123]
         with pytest.raises(ValidationError):
             model(
                 **{

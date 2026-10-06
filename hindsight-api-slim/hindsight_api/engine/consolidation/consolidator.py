@@ -1181,18 +1181,21 @@ def _build_response_model(
     create_action: type[_CreateAction] = _CreateAction
     update_action: type[_UpdateAction] = _UpdateAction
     if constrain_sources:
-        from typing import Literal
+        def add_source_id_schema(schema: dict[str, Any]) -> None:
+            # Keep runtime validation as list[str]. The enum guides providers that
+            # honor structured-output schemas; providers that ignore it must still
+            # reach the partial-resolution and warning path below.
+            schema["items"]["enum"] = valid_source_fact_ids
 
-        source_id_type = Literal.__getitem__(tuple(valid_source_fact_ids)) if valid_source_fact_ids else str
         create_action = create_model(
             "_ConstrainedCreateAction",
             __base__=_CreateAction,
-            source_fact_ids=(list[source_id_type], PydanticField(min_length=1)),
+            source_fact_ids=(list[str], PydanticField(min_length=1, json_schema_extra=add_source_id_schema)),
         )
         update_action = create_model(
             "_ConstrainedUpdateAction",
             __base__=_UpdateAction,
-            source_fact_ids=(list[source_id_type], PydanticField(min_length=1)),
+            source_fact_ids=(list[str], PydanticField(min_length=1, json_schema_extra=add_source_id_schema)),
         )
 
     response_fields: dict[str, Any] = {
